@@ -1,0 +1,221 @@
+---
+title: "CVS Health Community Access Analysis"
+subtitle: "County-Level Health Needs & Clinic Distribution Report"
+author: "Data Analysis Team"
+date: today
+format:
+  pdf:
+    documentclass: article
+    geometry: margin=1in
+    colorlinks: true
+    fig-width: 10
+    fig-height: 6
+    toc: true
+    toc-depth: 3
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{python}
+#| include: false
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+
+# load data
+data_path = Path("data/processed/CVS_FINAL_DATASET.csv")
+df = pd.read_csv(data_path)
+
+# clean data
+for col in df.columns:
+    try:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    except:
+        pass
+
+df["COUNTY"] = df["COUNTY"].astype(str).str.zfill(5)
+
+# create health burden score
+health_vars = ['stroke', 'physical_inactivity', 'self_care_disability', 'social_isolation']
+available_vars = [var for var in health_vars if var in df.columns]
+df['health_burden_score'] = df[available_vars].mean(axis=1)
+
+# create normalized scores
+df['health_need'] = (
+    (df['health_burden_score'] - df['health_burden_score'].min()) /
+    (df['health_burden_score'].max() - df['health_burden_score'].min())
+)
+
+if df['clinic_count'].max() > 0:
+    df['clinic_availability'] = df['clinic_count'] / df['clinic_count'].max()
+else:
+    df['clinic_availability'] = 0
+
+df['gap_score'] = df['health_need'] - df['clinic_availability']
+```
+
+# Executive Summary
+
+## Key Findings
+
+### Coverage Gap
+- **`r round((df['clinic_count'] == 0).sum() / len(df) * 100, 1)`%** of U.S. counties have zero CVS MinuteClinic locations
+- Only **`r (df['clinic_count'] > 0).sum()`** counties (**`r round((df['clinic_count'] > 0).sum() / len(df) * 100, 1)`%**) have at least one clinic
+- Total clinics across all counties: **`r int(df['clinic_count'].sum())`**
+
+### Socioeconomic Inequity
+- Counties without clinics have higher SVI scores: **`r round(df[df['clinic_count']==0]['svi_overall'].mean(), 3)`** vs **`r round(df[df['clinic_count']>0]['svi_overall'].mean(), 3)`**
+- Socioeconomic vulnerability: **`r round(df[df['clinic_count']==0]['svi_socioeconomic'].mean(), 3)`** (no clinics) vs **`r round(df[df['clinic_count']>0]['svi_socioeconomic'].mean(), 3)`** (with clinics)
+
+### Health Need Mismatch
+- Counties without clinics have higher health burden: **`r round(df[df['clinic_count']==0]['health_burden_score'].mean(), 2)`** vs **`r round(df[df['clinic_count']>0]['health_burden_score'].mean(), 2)`**
+- This indicates sicker populations have less access to CVS services
+
+# Key Statistics
+
+## Distribution of Clinic Counts
+
+```{python}
+#| fig-cap: "Distribution of CVS clinic counts across all U.S. counties. Most counties have zero clinics."
+plt.figure(figsize=(10, 6))
+plt.hist(df['clinic_count'], bins=50, edgecolor='black', alpha=0.7, color='steelblue')
+plt.axvline(df['clinic_count'].median(), color='red', linestyle='--', linewidth=2, 
+            label=f'Median: {df["clinic_count"].median():.1f}')
+plt.xlabel('Number of Clinics')
+plt.ylabel('Number of Counties')
+plt.title('Distribution of Clinic Counts', fontweight='bold')
+plt.legend()
+plt.grid(alpha=0.3)
+plt.show()
+```
+
+**what this shows:** the histogram reveals that most counties have zero clinics. the distribution is highly skewed, with a few counties having many clinics while the vast majority have none. this indicates CVS clinics are highly concentrated in specific areas.
+
+## Health Burden Distribution
+
+```{python}
+#| fig-cap: "Distribution of health burden scores. Higher scores indicate worse health outcomes."
+plt.figure(figsize=(10, 6))
+plt.hist(df['health_burden_score'], bins=50, edgecolor='black', alpha=0.7, color='purple')
+plt.axvline(df['health_burden_score'].mean(), color='red', linestyle='--', linewidth=2, 
+            label=f'Mean: {df["health_burden_score"].mean():.2f}')
+plt.axvline(df['health_burden_score'].median(), color='orange', linestyle='--', linewidth=2, 
+            label=f'Median: {df["health_burden_score"].median():.2f}')
+plt.xlabel('Health Burden Score')
+plt.ylabel('Number of Counties')
+plt.title('Distribution of Health Burden Scores', fontweight='bold')
+plt.legend()
+plt.grid(alpha=0.3)
+plt.show()
+```
+
+**what this shows:** health burden scores are normally distributed with some variation. counties with higher scores have worse health outcomes (more stroke, disability, inactivity, social isolation). comparing this to clinic distribution helps identify underserved areas.
+
+## Clinic Presence vs Health Burden
+
+```{python}
+#| fig-cap: "Comparison of health burden scores by clinic presence category."
+df['clinic_presence'] = df['clinic_count'].apply(lambda x: 'No Clinics' if x == 0 else ('1-2 Clinics' if x <= 2 else '3+ Clinics'))
+comparison_data = df.groupby('clinic_presence')['health_burden_score'].mean()
+
+plt.figure(figsize=(10, 6))
+plt.bar(comparison_data.index, comparison_data.values, color=['#d62728', '#ff7f0e', '#2ca02c'])
+plt.xlabel('Clinic Presence Category')
+plt.ylabel('Average Health Burden Score')
+plt.title('Health Burden by Clinic Presence', fontweight='bold')
+plt.xticks(rotation=45)
+plt.grid(axis='y', alpha=0.3)
+plt.show()
+```
+
+**what this shows:** counties with no clinics have the highest average health burden (red bar), indicating sicker populations have less access. counties with more clinics tend to have lower health burden, suggesting either better access leads to better health, or clinics are located in healthier areas.
+
+## SVI Quartiles and Clinic Distribution
+
+```{python}
+#| fig-cap: "Box plot showing clinic count distribution across SVI quartiles."
+df['svi_quartile'] = pd.qcut(df['svi_overall'], q=4, labels=['Low SVI (Q1)', 'Medium-Low SVI (Q2)', 
+                                                              'Medium-High SVI (Q3)', 'High SVI (Q4)'])
+
+plt.figure(figsize=(12, 6))
+sns.boxplot(data=df, x='svi_quartile', y='clinic_count', palette='viridis')
+plt.xlabel('SVI Quartile')
+plt.ylabel('Number of Clinics')
+plt.title('Clinic Count Distribution by Social Vulnerability Index Quartiles', fontweight='bold')
+plt.xticks(rotation=45)
+plt.grid(axis='y', alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+**what this shows:** the box plots reveal that counties in higher SVI quartiles (more vulnerable) tend to have fewer clinics. the median clinic count is zero across all quartiles, but the upper quartiles (outliers) show that some low-vulnerability counties have many clinics, while high-vulnerability counties rarely have clinics.
+
+# Top Underserved Counties
+
+```{python}
+#| fig-cap: "Top 20 most underserved counties based on population-adjusted gap score."
+# calculate population-adjusted gap if population data exists
+if 'population' in df.columns:
+    df['pop_adjusted_gap'] = df['health_need'] * df['population']
+    top_underserved = df.nlargest(20, 'pop_adjusted_gap')[
+        ['county_full', 'state_full', 'pop_adjusted_gap', 'health_burden_score', 
+         'clinic_count', 'population']]
+    
+    plt.figure(figsize=(12, 8))
+    colors = ['#d62728' if x == 0 else '#ff7f0e' if x <= 2 else '#2ca02c' 
+             for x in top_underserved['clinic_count']]
+    plt.barh(range(len(top_underserved)), top_underserved['pop_adjusted_gap'], color=colors)
+    plt.yticks(range(len(top_underserved)), 
+               [f"{row['county_full']}, {row['state_full']}" 
+                for _, row in top_underserved.iterrows()])
+    plt.xlabel('Population-Adjusted Gap Score', fontweight='bold')
+    plt.title('Top 20 Most Underserved Counties (High Need × Population)', fontweight='bold')
+    plt.gca().invert_yaxis()
+    plt.grid(axis='x', alpha=0.3)
+    
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor='#d62728', label='0 Clinics'),
+                     Patch(facecolor='#ff7f0e', label='1-2 Clinics'),
+                     Patch(facecolor='#2ca02c', label='3+ Clinics')]
+    plt.legend(handles=legend_elements, loc='lower right')
+    plt.tight_layout()
+    plt.show()
+```
+
+**what this shows:** these are the counties with the highest combination of health need and population size but low clinic access. red bars indicate counties with zero clinics - the highest priority for expansion. these counties represent the largest opportunity to impact the most people with the greatest health needs.
+
+# Strategic Recommendations
+
+## Priority 1: High-Impact Urban Expansion
+- Focus on large metropolitan counties with high health burden and moderate-to-low clinic density
+- Target: Los Angeles County, Harris County (Houston), Dallas County, Maricopa County (Phoenix)
+- Rationale: Maximum population impact with existing infrastructure
+
+## Priority 2: Rural High-Need Markets
+- Target rural counties with high health burden scores and zero clinics
+- Focus on Mississippi Delta, rural South, and Native American communities
+- Consider mobile clinics or partnerships with existing healthcare facilities
+
+## Priority 3: Vulnerable Community Access
+- Prioritize counties with high SVI scores and zero clinics
+- Address socioeconomic barriers to healthcare access
+- Consider sliding scale pricing or community health partnerships
+
+## Priority 4: Cluster-Based Expansion
+- Use K-means clustering results to identify similar counties
+- Develop standardized expansion strategies for each cluster type
+- Leverage successful clinic models from similar county types
+
+# Next Steps
+
+1. **Validate Findings**: Cross-reference identified underserved counties with local healthcare infrastructure and competitor presence
+2. **Market Research**: Conduct feasibility studies for top-priority expansion targets
+3. **Partnership Opportunities**: Explore partnerships with local health systems in underserved areas
+4. **Pilot Programs**: Launch pilot clinics in 2-3 high-priority counties to test expansion model
+5. **Monitor Impact**: Track health outcomes and utilization rates in new clinic locations
+6. **Iterate Strategy**: Use clustering results to refine expansion criteria and identify new opportunities
+
