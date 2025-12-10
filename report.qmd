@@ -25,6 +25,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
+import requests
+import plotly.express as px
 
 # load data
 data_path = Path("data/processed/CVS_FINAL_DATASET.csv")
@@ -45,10 +47,15 @@ available_vars = [var for var in health_vars if var in df.columns]
 df['health_burden_score'] = df[available_vars].mean(axis=1)
 
 # create normalized scores
-df['health_need'] = (
-    (df['health_burden_score'] - df['health_burden_score'].min()) /
-    (df['health_burden_score'].max() - df['health_burden_score'].min())
-)
+# handle case where all values are the same (would cause division by zero)
+health_min = df['health_burden_score'].min()
+health_max = df['health_burden_score'].max()
+if health_max > health_min:
+    df['health_need'] = (df['health_burden_score'] - health_min) / (health_max - health_min)
+else:
+    # if all values are the same, set health_need to 0.5 for all
+    df['health_need'] = 0.5
+    print("warning: all health burden scores are the same, using default health_need of 0.5")
 
 if df['clinic_count'].max() > 0:
     df['clinic_availability'] = df['clinic_count'] / df['clinic_count'].max()
@@ -56,6 +63,79 @@ else:
     df['clinic_availability'] = 0
 
 df['gap_score'] = df['health_need'] - df['clinic_availability']
+
+# load population data if not already in dataset
+if 'population' not in df.columns:
+    try:
+        # census ACS 5-year population variable
+        url = "https://api.census.gov/data/2022/acs/acs5?get=NAME,B01003_001E&for=county:*"
+        response = requests.get(url, timeout=30)
+        data = response.json()
+        
+        # convert to DataFrame
+        pop = pd.DataFrame(data[1:], columns=data[0])
+        pop = pop.rename(columns={
+            "NAME": "county_name",
+            "B01003_001E": "population",
+            "state": "state_fips",
+            "county": "county_fips"
+        })
+        
+        # create full 5-digit FIPS
+        pop["fips"] = pop["state_fips"].astype(str).str.zfill(2) + pop["county_fips"].astype(str).str.zfill(3)
+        pop["population"] = pd.to_numeric(pop["population"], errors='coerce')
+        pop = pop[['fips', 'population']].drop_duplicates()
+        
+        # merge with main dataframe
+        df['fips'] = df['fips'].astype(str).str.zfill(5)
+        pop['fips'] = pop['fips'].astype(str).str.zfill(5)
+        
+        # check merge success
+        before_merge = len(df)
+        df = df.merge(pop[['fips','population']], on='fips', how='left')
+        after_merge = len(df)
+        matched = df['population'].notna().sum()
+        
+        print(f"population merge: {matched}/{len(df)} counties matched ({matched/len(df)*100:.1f}%)")
+        
+        # fill missing population values with median to avoid NaN
+        if df['population'].isna().any():
+            median_pop = df['population'].median()
+            if pd.isna(median_pop):
+                median_pop = 100000  # fallback if all are NaN
+            df['population'] = df['population'].fillna(median_pop)
+            print(f"filled {df['population'].isna().sum()} missing population values with median: {median_pop:,.0f}")
+        
+        print("population data loaded successfully")
+    except Exception as e:
+        print(f"could not load population data: {e}")
+        # use default population for visualization
+        df['population'] = 100000
+        print("using default population value of 100,000")
+
+# ensure population column exists and has no NaN values
+if 'population' not in df.columns:
+    df['population'] = 100000
+else:
+    # fill any remaining NaN values
+    if df['population'].isna().any():
+        median_pop = df['population'].median()
+        if pd.isna(median_pop) or median_pop == 0:
+            median_pop = 100000
+        df['population'] = df['population'].fillna(median_pop)
+        print(f"final check: filled remaining NaN values with {median_pop:,.0f}")
+
+# ensure health_need has no NaN values
+if df['health_need'].isna().any():
+    df['health_need'] = df['health_need'].fillna(0)
+
+# create population-adjusted gap (ensure no NaN values)
+df['pop_adjusted_gap'] = df['health_need'] * df['population']
+# replace any NaN or inf values with 0
+df['pop_adjusted_gap'] = df['pop_adjusted_gap'].replace([np.inf, -np.inf, np.nan], 0)
+
+print(f"pop_adjusted_gap created: {df['pop_adjusted_gap'].notna().sum()}/{len(df)} valid values")
+print(f"pop_adjusted_gap range: {df['pop_adjusted_gap'].min():.0f} to {df['pop_adjusted_gap'].max():.0f}")
 ```
 
 # Executive Summary
@@ -154,39 +234,69 @@ plt.show()
 
 **what this shows:** the box plots reveal that counties in higher SVI quartiles (more vulnerable) tend to have fewer clinics. the median clinic count is zero across all quartiles, but the upper quartiles (outliers) show that some low-vulnerability counties have many clinics, while high-vulnerability counties rarely have clinics.
 
-# Top Underserved Counties
+# Geographic Expansion Opportunities Map
+
+this map shows where CVS should expand by combining health need, social vulnerability, and current clinic access. darker colors indicate higher priority expansion targets.
 
 ```{python}
-#| fig-cap: "Top 20 most underserved counties based on population-adjusted gap score."
-# calculate population-adjusted gap if population data exists
-if 'population' in df.columns:
-    df['pop_adjusted_gap'] = df['health_need'] * df['population']
-    top_underserved = df.nlargest(20, 'pop_adjusted_gap')[
-        ['county_full', 'state_full', 'pop_adjusted_gap', 'health_burden_score', 
-         'clinic_count', 'population']]
+#| fig-cap: "Expansion priority map showing counties by health need, SVI, and clinic access."
+# create expansion priority score
+# combines health need, SVI, and lack of clinics
+# higher score = higher priority for expansion
+df['expansion_priority'] = (
+    df['health_need'] * 0.4 +  # 40% weight on health need
+    df['svi_overall'] * 0.3 +  # 30% weight on vulnerability
+    (1 - df['clinic_availability']) * 0.3  # 30% weight on lack of clinics (inverted)
+)
+
+# ensure fips codes are properly formatted
+df['fips'] = df['fips'].astype(str).str.zfill(5)
+
+# download county boundary data for mapping
+try:
+    url = "https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json"
+    counties_geo = requests.get(url, timeout=30).json()
+    geo_loaded = True
+    print("geographic data loaded successfully")
+except Exception as e:
+    print(f"could not load geographic data: {e}")
+    geo_loaded = False
+
+if geo_loaded:
+    # create choropleth map showing expansion priority
+    fig = px.choropleth(
+        df,
+        geojson=counties_geo,
+        locations='fips',
+        color='expansion_priority',
+        color_continuous_scale="Reds",  # red = high priority
+        scope="usa",
+        labels={'expansion_priority': 'Expansion Priority Score'},
+        title="CVS Expansion Priority Map: Health Need + Vulnerability + Access Gap",
+        hover_data=['county_full', 'state_full', 'health_burden_score', 'svi_overall', 'clinic_count']
+    )
     
-    plt.figure(figsize=(12, 8))
-    colors = ['#d62728' if x == 0 else '#ff7f0e' if x <= 2 else '#2ca02c' 
-             for x in top_underserved['clinic_count']]
-    plt.barh(range(len(top_underserved)), top_underserved['pop_adjusted_gap'], color=colors)
-    plt.yticks(range(len(top_underserved)), 
-               [f"{row['county_full']}, {row['state_full']}" 
-                for _, row in top_underserved.iterrows()])
-    plt.xlabel('Population-Adjusted Gap Score', fontweight='bold')
-    plt.title('Top 20 Most Underserved Counties (High Need × Population)', fontweight='bold')
-    plt.gca().invert_yaxis()
-    plt.grid(axis='x', alpha=0.3)
+    fig.update_geos(fitbounds="locations", visible=False)
+    fig.update_layout(height=600, title_font_size=16)
+    fig.show()
     
-    from matplotlib.patches import Patch
-    legend_elements = [Patch(facecolor='#d62728', label='0 Clinics'),
-                     Patch(facecolor='#ff7f0e', label='1-2 Clinics'),
-                     Patch(facecolor='#2ca02c', label='3+ Clinics')]
-    plt.legend(handles=legend_elements, loc='lower right')
-    plt.tight_layout()
-    plt.show()
+    print("\n✓ expansion priority map created")
+    print("  darker red = higher priority for expansion")
+    print("  priority based on: health need (40%), SVI (30%), lack of clinics (30%)")
+    print(f"  priority score range: {df['expansion_priority'].min():.3f} to {df['expansion_priority'].max():.3f}")
+else:
+    print("geographic data not available - cannot create map")
 ```
 
-**what this shows:** these are the counties with the highest combination of health need and population size but low clinic access. red bars indicate counties with zero clinics - the highest priority for expansion. these counties represent the largest opportunity to impact the most people with the greatest health needs.
+**what this map shows:** 
+
+- **darker red areas**: counties with high expansion priority - these combine high health need, high vulnerability, and low clinic access
+- **lighter areas**: counties with lower priority - may have clinics already, lower health needs, or lower vulnerability  
+- **hover over counties**: see specific values for health burden, SVI, and clinic count
+- **expansion targets**: focus on the darkest red areas where CVS can make the biggest impact
+- **geographic patterns**: the map reveals regional clusters of underserved communities (mississippi delta, rural south, etc.)
+
+this map helps visually identify where CVS should prioritize expansion efforts to maximize both business impact and community health outcomes.
 
 # Strategic Recommendations
 

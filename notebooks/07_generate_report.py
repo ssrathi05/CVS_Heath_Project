@@ -13,6 +13,8 @@ from matplotlib.backends.backend_pdf import PdfPages
 import matplotlib.patches as mpatches
 from datetime import datetime
 import warnings
+import requests
+import json
 warnings.filterwarnings('ignore')
 
 # Set style for professional-looking plots
@@ -181,6 +183,189 @@ Key Findings:
         axes[1].set_ylabel('Health Burden Score')
         axes[1].tick_params(axis='x', rotation=45)
         axes[1].grid(axis='y', alpha=0.3)
+        
+        plt.tight_layout()
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close()
+        
+        # ========== EXPANSION PRIORITY MAP (US County Map) ==========
+        # create expansion priority score
+        # what this means: expansion priority combines three factors to identify where CVS should expand:
+        # 1. health need (40%): how sick/unhealthy the population is (stroke, disability, inactivity, isolation)
+        # 2. social vulnerability (30%): socioeconomic challenges (poverty, unemployment, low education)
+        # 3. lack of clinics (30%): counties with zero or few clinics relative to others
+        # higher score = higher priority for expansion (more need, more vulnerable, less access)
+        
+        if 'health_need' not in df.columns and 'health_burden_score' in df.columns:
+            health_min = df['health_burden_score'].min()
+            health_max = df['health_burden_score'].max()
+            if health_max > health_min:
+                df['health_need'] = (df['health_burden_score'] - health_min) / (health_max - health_min)
+            else:
+                df['health_need'] = 0.5
+        
+        if 'clinic_availability' not in df.columns:
+            if df['clinic_count'].max() > 0:
+                df['clinic_availability'] = df['clinic_count'] / df['clinic_count'].max()
+            else:
+                df['clinic_availability'] = 0
+        
+        # calculate expansion priority score
+        df['expansion_priority'] = (
+            df['health_need'] * 0.4 +  # 40% weight on health need
+            df['svi_overall'] * 0.3 +  # 30% weight on vulnerability
+            (1 - df['clinic_availability']) * 0.3  # 30% weight on lack of clinics
+        )
+        
+        # create US map visualization using plotly (save as image)
+        try:
+            import plotly.express as px
+            import plotly.graph_objects as go
+            from PIL import Image
+            import io
+            
+            # ensure fips codes are properly formatted
+            df['fips'] = df['fips'].astype(str).str.zfill(5)
+            
+            # download county boundary data
+            url = "https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json"
+            counties_geo = requests.get(url, timeout=30).json()
+            
+            # create choropleth map
+            fig_map = px.choropleth(
+                df,
+                geojson=counties_geo,
+                locations='fips',
+                color='expansion_priority',
+                color_continuous_scale="Reds",
+                scope="usa",
+                labels={'expansion_priority': 'Expansion Priority Score'},
+                title="CVS Expansion Priority Map: Where to Expand<br><sub>Darker Red = Higher Priority (High Need + High Vulnerability + Low Clinic Access)</sub>",
+                hover_data=['county_full', 'state_full', 'health_burden_score', 'svi_overall', 'clinic_count']
+            )
+            
+            fig_map.update_geos(fitbounds="locations", visible=False)
+            fig_map.update_layout(height=700, title_font_size=14)
+            
+            # save map as image
+            img_bytes = fig_map.to_image(format="png", width=1200, height=700)
+            img = Image.open(io.BytesIO(img_bytes))
+            
+            # add to PDF
+            fig, ax = plt.subplots(figsize=(11, 8.5))
+            ax.imshow(img, aspect='auto', extent=[0, 1, 0, 1])
+            ax.axis('off')
+            ax.set_title('CVS Expansion Priority Map\nDarker Red = Higher Priority for Expansion', 
+                        fontsize=14, fontweight='bold', pad=20)
+            pdf.savefig(fig, bbox_inches='tight')
+            plt.close()
+            
+            print("✓ US county map created successfully")
+            
+        except Exception as e:
+            print(f"Could not create interactive map: {e}")
+            print("Creating state-level visualization instead...")
+            
+            # fallback: state-level visualization
+            state_expansion = df.groupby('state_full').agg({
+                'expansion_priority': 'mean',
+                'health_burden_score': 'mean',
+                'svi_overall': 'mean',
+                'clinic_count': 'sum',
+                'population': 'sum'
+            }).reset_index()
+            
+            state_expansion = state_expansion.sort_values('expansion_priority', ascending=False).head(20)
+            
+            fig, ax = plt.subplots(figsize=(11, 8.5))
+            colors_map = plt.cm.Reds(state_expansion['expansion_priority'] / state_expansion['expansion_priority'].max())
+            bars = ax.barh(range(len(state_expansion)), state_expansion['expansion_priority'], color=colors_map)
+            ax.set_yticks(range(len(state_expansion)))
+            ax.set_yticklabels(state_expansion['state_full'])
+            ax.set_xlabel('Average Expansion Priority Score', fontsize=12, fontweight='bold')
+            ax.set_title('Top 20 States by Expansion Priority\n(Health Need + Vulnerability + Access Gap)', 
+                        fontsize=14, fontweight='bold')
+            ax.invert_yaxis()
+            ax.grid(axis='x', alpha=0.3)
+            
+            # add value labels
+            for i, (idx, row) in enumerate(state_expansion.iterrows()):
+                ax.text(row['expansion_priority'] + 0.01, i, 
+                       f"{row['expansion_priority']:.3f}\n({int(row['clinic_count'])} clinics)", 
+                       va='center', fontsize=9)
+            
+            plt.tight_layout()
+            pdf.savefig(fig, bbox_inches='tight')
+            plt.close()
+        
+        # ========== EXPANSION PRIORITY EXPLANATION PAGE ==========
+        fig, ax = plt.subplots(figsize=(11, 8.5))
+        ax.axis('off')
+        
+        explanation_text = """
+EXPANSION PRIORITY SCORE - WHAT IT MEANS
+
+The Expansion Priority Score identifies where CVS should prioritize opening new clinics.
+It combines three key factors:
+
+1. HEALTH NEED (40% weight)
+   • Measures how sick/unhealthy the population is
+   • Based on: stroke rates, physical inactivity, disability, social isolation
+   • Higher health need = sicker population that needs more healthcare access
+
+2. SOCIAL VULNERABILITY (30% weight)
+   • Measures socioeconomic challenges in the community
+   • Based on: poverty, unemployment, low education, housing issues
+   • Higher SVI = more vulnerable community with fewer resources
+
+3. LACK OF CLINICS (30% weight)
+   • Measures how underserved the area is by CVS
+   • Counties with zero or few clinics get higher scores
+   • More clinics = lower priority (already served)
+
+HOW TO READ THE MAP:
+• DARKER RED = Higher priority for expansion
+  - High health need + High vulnerability + Low clinic access
+  - These are the counties where CVS can make the biggest impact
+  
+• LIGHTER RED/WHITE = Lower priority
+  - May already have clinics, lower health needs, or lower vulnerability
+  - Less urgent for expansion
+
+EXPANSION STRATEGY:
+Focus on the darkest red areas - these represent the best opportunities
+to serve underserved communities while building the CVS health network.
+        """
+        
+        ax.text(0.1, 0.95, explanation_text, transform=ax.transAxes, 
+                fontsize=11, verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.7))
+        
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close()
+        
+        # ========== EXPANSION PRIORITY SCATTER PLOT ==========
+        # create a scatter plot showing expansion priority vs key metrics
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        fig.suptitle('Expansion Priority Analysis', fontsize=16, fontweight='bold')
+        
+        # plot 1: expansion priority vs health burden
+        scatter1 = axes[0].scatter(df['health_burden_score'], df['expansion_priority'], 
+                                  c=df['clinic_count'], cmap='RdYlGn_r', alpha=0.6, s=30)
+        axes[0].set_xlabel('Health Burden Score', fontsize=11)
+        axes[0].set_ylabel('Expansion Priority Score', fontsize=11)
+        axes[0].set_title('Expansion Priority vs Health Burden\n(Color = Clinic Count)', fontweight='bold')
+        axes[0].grid(alpha=0.3)
+        plt.colorbar(scatter1, ax=axes[0], label='Clinic Count')
+        
+        # plot 2: expansion priority vs SVI
+        scatter2 = axes[1].scatter(df['svi_overall'], df['expansion_priority'], 
+                                  c=df['clinic_count'], cmap='RdYlGn_r', alpha=0.6, s=30)
+        axes[1].set_xlabel('Social Vulnerability Index (SVI)', fontsize=11)
+        axes[1].set_ylabel('Expansion Priority Score', fontsize=11)
+        axes[1].set_title('Expansion Priority vs Social Vulnerability\n(Color = Clinic Count)', fontweight='bold')
+        axes[1].grid(alpha=0.3)
+        plt.colorbar(scatter2, ax=axes[1], label='Clinic Count')
         
         plt.tight_layout()
         pdf.savefig(fig, bbox_inches='tight')
